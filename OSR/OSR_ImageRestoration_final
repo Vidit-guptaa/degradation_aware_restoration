@@ -1,0 +1,235 @@
+% OSR Haze Detection
+
+clear; clc; close all;   % Reset workspace, command window, and figures
+
+%% ── 1. LOAD IMAGE ─────────────────────────────────────────
+
+% Open file selection dialog
+[fname, fpath] = uigetfile({'*.jpg;*.png;*.bmp','Images'});
+
+% Check if user cancelled selection
+if isequal(fname,0)
+    error('No image selected');
+end
+
+% Read image and convert to double (range 0–1)
+img = im2double(imread(fullfile(fpath,fname)));
+
+% Convert grayscale image to RGB if needed
+if size(img,3) == 1
+    img = repmat(img,[1 1 3]);
+end
+
+% Resize large images to reduce computation load
+if max(size(img)) > 1500
+    img = imresize(img,0.5);
+end
+
+% Display image info
+fprintf('Loaded: %s [%d x %d]\n', fname, size(img,1), size(img,2));
+
+%% ── 2. DETECT DEGRADATION ─────────────────────────────────
+
+% Detect type of degradation (rain / haze / blur)
+degType = detectDegradation(img);
+fprintf('Detected: %s\n', degType);
+
+%% ── 3. INPUT TRANSFORM ────────────────────────────────────
+
+% Convert image into amplitude and phase representation
+[amp, phase] = inputTransform(img);
+
+%% ── 4. RESTORE ────────────────────────────────────────────
+
+% Apply degradation-specific enhancement
+ampOut = enhanceAmplitude(amp, degType);
+
+%% ── 5. RECONSTRUCTION ─────────────────────────────────────
+
+% Reconstruct image using amplitude and phase
+restored = ampOut .* cos(phase);
+
+% Get dimensions of restored and original image
+[h1,w1,~] = size(restored);
+[h2,w2,~] = size(img);
+
+% Resize original image if sizes mismatch
+if h1 ~= h2 || w1 ~= w2
+    img = imresize(img,[h1 w1]);
+end
+
+% Blend restored image with original (stabilizes output)
+restored = 0.6*restored + 0.4*img;
+
+% Clip values to valid range [0,1]
+restored = min(max(restored,0),1);
+
+%% ── 6. POST PROCESS ──────────────────────────────────────
+
+% Apply contrast enhancement in LAB space
+restored = postProcess(restored);
+
+%% ── 7. PSNR CALCULATION ──────────────────────────────────
+
+% Compute PSNR (self-reference)
+psnrVal = psnr(restored, img);
+fprintf('PSNR value: %.2f dB\n', psnrVal);
+
+%% ── 8. DISPLAY & SAVE ────────────────────────────────────
+
+figure;
+subplot(1,2,1); imshow(img); title('Input');      % Show input image
+subplot(1,2,2); imshow(restored); title('Restored'); % Show output
+
+% Save output image
+imwrite(restored, fullfile(fpath,'restored_output.png'));
+
+%% =========================================================
+%                FUNCTIONS
+%% =========================================================
+
+function degType = detectDegradation(img)
+
+% Convert image to grayscale for analysis
+gray = rgb2gray(img);
+
+% Laplacian filter to detect blur (edge strength)
+lapImg = imfilter(gray, fspecial('laplacian',0.5));
+lapVar = var(lapImg(:));   % Variance of edges
+
+% Compute brightness and contrast
+meanL = mean(gray(:));    % Average brightness
+stdL  = std(gray(:));     % Contrast
+
+% Compute directional variance (rain detection)
+vertVar = mean(var(gray,[],1));   % Column-wise variance
+horzVar = mean(var(gray,[],2));   % Row-wise variance
+rainScore = vertVar/(horzVar+1e-8);
+
+% Compute gradients for directional edge strength
+[Gx, Gy] = gradient(gray);
+vertical_edges = mean(abs(Gx(:)));
+horizontal_edges = mean(abs(Gy(:)));
+
+% Ratio of vertical to horizontal edges
+edge_ratio = vertical_edges/(horizontal_edges+1e-8);
+
+% ---- Decision Logic ----
+
+% Haze: bright + low contrast
+if meanL > 0.55 && stdL < 0.10
+    degType = 'haze';
+
+% Rain: strong vertical structure + texture
+elseif rainScore > 1.8 && edge_ratio > 1.5 && stdL > 0.1
+    degType = 'rain';
+
+% Blur: weak edges
+elseif lapVar < 0.002
+    degType = 'blur';
+
+% Default case
+else
+    degType = 'haze';
+end
+
+end
+
+% ----------------------------------------------------------
+
+function [amp, phase] = inputTransform(img)
+
+% Amplitude = absolute intensity (content)
+amp = abs(img);
+
+% Phase = normalized intensity mapped to [-pi, pi]
+phase = img;
+phase = (phase - min(phase(:))) / (max(phase(:))-min(phase(:))+1e-8);
+phase = phase*2*pi - pi;
+
+end
+
+% ----------------------------------------------------------
+
+function ampOut = enhanceAmplitude(amp, degType)
+
+% Initialize output
+ampOut = zeros(size(amp));
+
+switch degType
+
+    case 'rain'
+        for c = 1:size(amp,3)
+            ch = amp(:,:,c);
+
+            % Detect vertical streaks using morphology
+            se = strel('line',9,0);
+            mask = imdilate(ch,se) - imerode(ch,se);
+            rainMask = mask > 0.12;
+
+            % Apply median filtering
+            filtered = medfilt2(ch,[5 5],'symmetric');
+
+            % Replace only detected rain pixels
+            ch(rainMask) = filtered(rainMask);
+
+            ampOut(:,:,c) = ch;
+        end
+
+    case 'haze'
+        % Estimate haze strength from contrast
+        gray = rgb2gray(amp);
+        haze_strength = 1 - std(gray(:));
+
+        % Adaptive contrast limits
+        low_in = haze_strength * 0.3;
+        high_in = 1 - haze_strength * 0.3;
+
+        for c = 1:3
+            ch = amp(:,:,c);
+
+            % Stretch contrast
+            ch = imadjust(ch, [low_in high_in], [0 1]);
+
+            % Slight sharpening
+            ch = imsharpen(ch, 'Radius',1, 'Amount',0.5);
+
+            ampOut(:,:,c) = ch;
+        end
+
+        % Clamp values
+        ampOut = min(max(ampOut,0),1);
+
+    case 'blur'
+        % Sharpen blurred images
+        ampOut = imsharpen(amp);
+
+    otherwise
+        ampOut = amp;
+end
+
+end
+
+% ----------------------------------------------------------
+
+function out = postProcess(img)
+
+% Convert RGB to LAB color space
+lab = rgb2lab(img);
+
+% Extract luminance channel
+L = lab(:,:,1)/100;
+
+% Apply CLAHE for contrast enhancement
+L = adapthisteq(L);
+
+% Replace enhanced luminance
+lab(:,:,1) = L*100;
+
+% Convert back to RGB
+out = lab2rgb(lab);
+
+% Clamp values
+out = min(max(out,0),1);
+
+end
